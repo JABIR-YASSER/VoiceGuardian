@@ -72,6 +72,25 @@ let intentionalLeave = false;
  */
 let reconnecting = false;
 
+/*
+ * Used to delay reconnect decisions because Discord may emit
+ * VOICE_STATE_UPDATES and VOICE_CHANNEL_SELECT in different orders.
+ */
+let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+/*
+ * True while we are waiting to determine whether a disconnect
+ * was intentional or external.
+ */
+let disconnectPending = false;
+
+/*
+ * Runtime wrapper for Discord's voice-channel selection action.
+ * This lets us detect the actual user-intent call:
+ * selectVoiceChannel(null) = user intentionally disconnecting.
+ */
+let restoreVoiceChannelAction: (() => void) | null = null;
+
 
 /* -------------------------------------------------------------------------- */
 /* Logging                                                                    */
@@ -354,6 +373,13 @@ function reconnectToLastChannel() {
             return;
         }
 
+        if (intentionalLeave) {
+            log(
+                "Reconnect cancelled because the disconnect became intentional."
+            );
+            return;
+        }
+
         reconnecting = true;
 
         try {
@@ -389,6 +415,74 @@ function reconnectToLastChannel() {
         }, 2000);
 
     }, 250);
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Intent detection                                                           */
+/* -------------------------------------------------------------------------- */
+
+function installVoiceIntentPatch() {
+    if (restoreVoiceChannelAction) {
+        return;
+    }
+
+    try {
+        const actions = VoiceChannelActions as any;
+        const original = actions?.selectVoiceChannel;
+
+        if (typeof original !== "function") {
+            log("selectVoiceChannel action is not available for intent detection.");
+            return;
+        }
+
+        const wrapped = function (this: unknown, ...args: any[]) {
+            const channelId = args[0] ?? null;
+
+            if (!reconnecting && channelId == null) {
+                intentionalLeave = true;
+                disconnectPending = false;
+
+                if (disconnectTimer) {
+                    clearTimeout(disconnectTimer);
+                    disconnectTimer = null;
+                }
+
+                log("User initiated voice disconnect.");
+            }
+
+            if (!reconnecting && channelId != null) {
+                intentionalLeave = false;
+
+                if (disconnectTimer) {
+                    clearTimeout(disconnectTimer);
+                    disconnectTimer = null;
+                }
+
+                disconnectPending = false;
+            }
+
+            return original.apply(this, args);
+        };
+
+        actions.selectVoiceChannel = wrapped;
+
+        restoreVoiceChannelAction = () => {
+            try {
+                if (actions.selectVoiceChannel === wrapped) {
+                    actions.selectVoiceChannel = original;
+                }
+            } catch (error) {
+                log("Failed to restore selectVoiceChannel action:", error);
+            }
+
+            restoreVoiceChannelAction = null;
+        };
+
+        log("Installed voice disconnect intent detection.");
+    } catch (error) {
+        log("Failed to install voice disconnect intent detection:", error);
+    }
 }
 
 
@@ -450,6 +544,41 @@ export default definePlugin({
                     channelId
                 );
 
+                /*
+                 * If a disconnect is currently pending and Discord emits
+                 * the same channel ID again, do NOT clear intentionalLeave.
+                 * Discord can emit this event after the user clicks
+                 * Disconnect, and that used to make VoiceGuardian think
+                 * the disconnect was external.
+                 */
+                if (disconnectPending) {
+                    if (channelId !== lastVoiceChannelId) {
+                        /*
+                         * The user selected a different channel while a
+                         * reconnect decision was pending. The old reconnect
+                         * must be cancelled.
+                         */
+                        if (disconnectTimer) {
+                            clearTimeout(disconnectTimer);
+                            disconnectTimer = null;
+                        }
+
+                        disconnectPending = false;
+                        intentionalLeave = false;
+                        lastVoiceChannelId = channelId;
+
+                        log(
+                            "Different voice channel selected while disconnect was pending. Reconnect cancelled."
+                        );
+                    } else {
+                        log(
+                            "Same voice channel selected during pending disconnect. Keeping disconnect state unchanged."
+                        );
+                    }
+
+                    return;
+                }
+
                 lastVoiceChannelId =
                     channelId;
 
@@ -461,11 +590,9 @@ export default definePlugin({
             /*
              * channelId === null
              *
-             * Discord also emits this during startup/navigation,
-             * so DON'T immediately mark every null event as intentional.
-             *
-             * We only consider it intentional if there is actually
-             * no current voice state for ourselves.
+             * A null selection can happen during normal Discord navigation,
+             * so only treat it as an intentional leave when Discord is no
+             * longer reporting us as connected.
              */
             const myUserId =
                 getMyUserId();
@@ -479,20 +606,11 @@ export default definePlugin({
                     myUserId
                 );
 
-            /*
-             * If Discord still says we're in the channel,
-             * this null selection was navigation noise.
-             */
             if (myState?.channelId) {
                 log(
                     "Ignoring null channel selection because voice state still shows us connected to:",
                     myState.channelId
                 );
-
-                lastVoiceChannelId =
-                    myState.channelId;
-
-                intentionalLeave = false;
 
                 return;
             }
@@ -501,6 +619,13 @@ export default definePlugin({
              * We genuinely left.
              */
             intentionalLeave = true;
+
+            if (disconnectTimer) {
+                clearTimeout(disconnectTimer);
+                disconnectTimer = null;
+            }
+
+            disconnectPending = false;
 
             log(
                 "User intentionally disconnected from:",
@@ -555,6 +680,13 @@ export default definePlugin({
                 /* ---------------------------------------------------------- */
 
                 if (channelId) {
+                    if (disconnectTimer) {
+                        clearTimeout(disconnectTimer);
+                        disconnectTimer = null;
+                    }
+
+                    disconnectPending = false;
+
                     lastVoiceChannelId =
                         channelId;
 
@@ -681,31 +813,72 @@ export default definePlugin({
                     );
 
                     /*
-                     * If the user deliberately left,
-                     * do NOT reconnect.
+                     * If Discord has already told us that the leave was
+                     * intentional, cancel any pending reconnect immediately.
                      */
                     if (intentionalLeave) {
                         log(
                             "Disconnect appears intentional. Not reconnecting."
                         );
 
+                        if (disconnectTimer) {
+                            clearTimeout(disconnectTimer);
+                            disconnectTimer = null;
+                        }
+
+                        disconnectPending = false;
                         continue;
                     }
 
                     /*
-                     * Otherwise somebody/server disconnected us.
+                     * Discord can emit VOICE_STATE_UPDATES before
+                     * VOICE_CHANNEL_SELECT. Wait briefly before deciding
+                     * whether the disconnect was external.
                      */
+                    disconnectPending = true;
+
+                    if (disconnectTimer) {
+                        clearTimeout(disconnectTimer);
+                    }
+
                     log(
-                        "External disconnect detected."
+                        "Waiting 300ms to determine whether the disconnect was intentional..."
                     );
 
-                    reconnectToLastChannel();
+                    disconnectTimer = setTimeout(() => {
+                        disconnectTimer = null;
+
+                        if (!disconnectPending) {
+                            return;
+                        }
+
+                        disconnectPending = false;
+
+                        if (intentionalLeave) {
+                            log(
+                                "Disconnect confirmed as intentional. Reconnect disabled."
+                            );
+                            return;
+                        }
+
+                        log(
+                            "External disconnect confirmed."
+                        );
+
+                        reconnectToLastChannel();
+                    }, 300);
                 }
             }
         },
     },
 
     start() {
+        /*
+         * Detect the user's explicit Disconnect action before the
+         * resulting VOICE_STATE_UPDATE reaches the plugin.
+         */
+        installVoiceIntentPatch();
+
         /*
          * Capture the current voice channel immediately.
          */
@@ -722,11 +895,26 @@ export default definePlugin({
             );
         }
 
+        disconnectPending = false;
+        intentionalLeave = false;
+
+        if (disconnectTimer) {
+            clearTimeout(disconnectTimer);
+            disconnectTimer = null;
+        }
+
         log("Started");
     },
 
     stop() {
         log("Stopped");
+
+        if (disconnectTimer) {
+            clearTimeout(disconnectTimer);
+            disconnectTimer = null;
+        }
+
+        disconnectPending = false;
 
         lastVoiceChannelId =
             null;
